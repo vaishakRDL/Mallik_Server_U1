@@ -1,5 +1,6 @@
 const { connection, CustomError, handleErrorResponse, handleSuccessResponse } = require("../../config/dbSql");
 const exceljs = require("exceljs");
+const JSZip = require("jszip");
 const { currentDateTime } = require("../../utility/utilityFunction");
 
 exports.template = async (req, res) => {
@@ -44,15 +45,291 @@ exports.template = async (req, res) => {
     }
 };
 
+/* ------------------------------ CSL IMPORT ------------------------------ */
+
+const IMPORT_TYPES = ['View', 'Import', 'Export'];
+const PACKLIST_SHEET = 'PackList';     // part rows + header contract no / FIM (row 3)
+const CONTRACT_SHEET = 'CSL-M';        // Duty (C2) and Stop (C3)
+const FIRST_DATA_ROW = 3;
+
+// PackList columns
+const COL = { CONTRACT: 1, PART: 2, QTY: 3, DESC: 5, BOX: 6 };
+
+const SPREADSHEETML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const NS_PREFIX_DECL = new RegExp(`\\sxmlns:(\\w+)="${escapeRegExp(SPREADSHEETML_NS)}"`);
+
+// The import only reads these two sheets (same name rules as getWorksheet / findSheet below)
+const isNeededSheet = (name) =>
+    name === PACKLIST_SHEET || (name || '').trim().toUpperCase() === CONTRACT_SHEET.toUpperCase();
+
+const decodeXmlAttr = (s) =>
+    s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+
+const getXmlAttr = (tag, attrRegex) => {
+    const match = tag.match(attrRegex);
+    return match ? decodeXmlAttr(match[1]) : null;
+};
+
+/*
+ * CSL files carry ~14 sheets (one "Contract BOM" alone is ~3 MB of XML) but the import reads
+ * only PackList and CSL-M. Remove the other worksheet parts from the in-memory copy so exceljs
+ * parses only what is used. Shared strings and styles are kept, so cell values are unchanged.
+ * exceljs skips sheets whose part is missing (as it does for chart sheets).
+ */
+const dropUnusedSheets = async (zip) => {
+    const wbPart = zip.file('xl/workbook.xml');
+    const relsPart = zip.file('xl/_rels/workbook.xml.rels');
+    if (!wbPart || !relsPart) return;
+
+    const [wbXml, relsXml] = await Promise.all([wbPart.async('string'), relsPart.async('string')]);
+
+    // rId -> part path, resolved the same way exceljs does
+    const targets = {};
+    for (const tag of relsXml.match(/<(?:\w+:)?Relationship\b[^>]*>/g) || []) {
+        const id = getXmlAttr(tag, /\sId="([^"]*)"/);
+        const target = getXmlAttr(tag, /\sTarget="([^"]*)"/);
+        if (id && target) targets[id] = `xl/${target.replace(/^(\s|\/xl\/)+/, '')}`;
+    }
+
+    const sheets = (wbXml.match(/<(?:\w+:)?sheet\b[^>]*>/g) || []).map((tag) => ({
+        name: getXmlAttr(tag, /\sname="([^"]*)"/),
+        path: targets[getXmlAttr(tag, /\s(?:\w+:)?id="([^"]*)"/)],
+    }));
+
+    // Only prune when the needed sheets were clearly identified; otherwise leave the file as is
+    if (!sheets.some((s) => isNeededSheet(s.name) && s.path && zip.file(s.path))) return;
+
+    for (const { name, path } of sheets) {
+        if (isNeededSheet(name) || !path) continue;
+
+        const part = path.match(/^xl\/worksheets\/(sheet\d+\.xml)$/);
+        if (!part) continue; // only regular worksheet parts are dropped
+
+        zip.remove(path);
+        zip.remove(`xl/worksheets/_rels/${part[1]}.rels`);
+    }
+};
+
+/*
+ * Some tools (e.g. the .NET OpenXML SDK) write valid xlsx files with prefixed tags
+ * (<x:workbook>, <ap:Properties>, unprefixed <lastModifiedBy>) that exceljs cannot parse.
+ * Rewrite the sheet XML to the unprefixed form exceljs expects and drop the document
+ * property parts (author/app metadata, not used by the import) when they are in that form.
+ */
+const normalizePrefixedParts = async (zip) => {
+    for (const name of Object.keys(zip.files)) {
+        if (zip.files[name].dir || !name.endsWith('.xml')) continue;
+
+        const xml = await zip.file(name).async('string');
+        const match = xml.match(NS_PREFIX_DECL);
+        if (!match) continue;
+
+        const prefix = match[1];
+        let out = xml.replace(new RegExp(`(</?)${prefix}:`, 'g'), '$1');
+        out = out.replace(NS_PREFIX_DECL, /\sxmlns="/.test(out) ? '' : ` xmlns="${SPREADSHEETML_NS}"`);
+        zip.file(name, out);
+    }
+
+    const expectedRoot = {
+        'docProps/core.xml': /<cp:coreProperties[\s>]/,
+        'docProps/app.xml': /<Properties[\s>]/,
+    };
+    for (const [name, rootTag] of Object.entries(expectedRoot)) {
+        const part = zip.file(name);
+        if (part && !rootTag.test(await part.async('string'))) zip.remove(name);
+    }
+};
+
+// Build the in-memory copy exceljs loads: unused sheets dropped, prefixed XML normalised if needed
+const prepareXlsx = async (buffer) => {
+    const zip = await JSZip.loadAsync(buffer);
+
+    // Prune first so normalisation only touches the parts that remain
+    await dropUnusedSheets(zip);
+
+    const wbPart = zip.file('xl/workbook.xml');
+    if (wbPart && NS_PREFIX_DECL.test(await wbPart.async('string'))) {
+        await normalizePrefixedParts(zip);
+    }
+
+    // No compression: the copy only lives in memory, so skip the deflate cost
+    return zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
+};
+
+const loadXlsx = async (buffer) => {
+    const workbook = new exceljs.Workbook();
+    await workbook.xlsx.load(buffer);
+    return workbook;
+};
+
+// Decode one uploaded file ({ name, data: base64 data URL }) into a workbook
+const loadWorkbook = async (file) => {
+    if (!file || typeof file.data !== 'string') {
+        throw new CustomError(`Invalid file data${file?.name ? `: ${file.name}` : ''}`, 400);
+    }
+
+    const base64Data = file.data.replace(/^data:.*?;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+
+    try {
+        return await loadXlsx(await prepareXlsx(buffer));
+    } catch (prepErr) {
+        // Safety net: if pre-processing ever fails, load the untouched file as before
+        try {
+            return await loadXlsx(buffer);
+        } catch (err) {
+            // exceljs throws low-level errors (e.g. "reading 'sheets'") for files it cannot parse
+            throw new CustomError(
+                `File ${file.name || ''} could not be read (${err.message}). Open it in Excel, use Save As "Excel Workbook (*.xlsx)" and import again.`,
+                400
+            );
+        }
+    }
+};
+
+// Sheet lookup ignoring case and surrounding spaces, so a moved/renamed-case sheet is still found
+const findSheet = (workbook, sheetName) =>
+    workbook.worksheets.find(
+        (ws) => (ws.name || '').trim().toUpperCase() === sheetName.toUpperCase()
+    );
+
+// Validate one PackList row; returns the first problem found, or null
+const validateRow = (row, { hdrContractNo, FIM }) => {
+    const contractNo = row.getCell(COL.CONTRACT).value;
+    const boxNo = row.getCell(COL.BOX).value;
+
+    if (boxNo == null) return `Box number is empty in Contract No ${hdrContractNo}`;
+    if (!String(boxNo).startsWith(FIM)) return `Box number does not start with FIM: ${boxNo} at Contract No ${hdrContractNo}`;
+    if (hdrContractNo !== contractNo) return `Mismatched Contract no ${contractNo} in sheet with header ${hdrContractNo}`;
+    if (row.getCell(COL.QTY).value == null) return `Quantity required for Part ${row.getCell(COL.PART).value}`;
+
+    return null;
+};
+
+// Read one CSL file: header details, part rows and validation errors
+const parseCslWorkbook = (workbook, fileName) => {
+    const packList = workbook.getWorksheet(PACKLIST_SHEET);
+    if (!packList) {
+        throw new CustomError(`Sheet ${PACKLIST_SHEET} not found in file ${fileName || ''}`.trim(), 400);
+    }
+
+    const hdrRow = packList.getRow(FIRST_DATA_ROW);
+    const hdrContractNo = hdrRow.getCell(COL.CONTRACT).text || '';
+    const rowFIM = hdrRow.getCell(COL.BOX).text || '';
+    const FIM = (rowFIM.match(/^[^\d]*/) || [''])[0];
+
+    const errorMessages = new Set();
+    const items = [];
+
+    packList.eachRow((row, rowNumber) => {
+        if (rowNumber < FIRST_DATA_ROW) return;
+
+        const contractNo = row.getCell(COL.CONTRACT).value;
+        const boxNo = row.getCell(COL.BOX).value;
+
+        if (!contractNo && !boxNo) return; // skip empty rows
+
+        const error = validateRow(row, { hdrContractNo, FIM });
+        if (error) errorMessages.add(error);
+
+        items.push({
+            id: rowNumber,
+            contractNo,
+            partNo: row.getCell(COL.PART).value,
+            Qty: row.getCell(COL.QTY).value,
+            desc: row.getCell(COL.DESC).value,
+            boxNo,
+        });
+    });
+
+    // Duty and Stop come from the CSL-M sheet, found by name because its position can change
+    const contractWS = findSheet(workbook, CONTRACT_SHEET);
+    if (!contractWS) {
+        errorMessages.add(`Sheet ${CONTRACT_SHEET} not found in Contract No ${hdrContractNo}`);
+    }
+
+    return {
+        contractNo: hdrContractNo,
+        items,
+        details: {
+            FIM,
+            duty: contractWS ? contractWS.getCell('C2').value : null,
+            stop: contractWS ? contractWS.getCell('C3').value : null,
+            type: FIM.replace(/FIM/g, '') || FIM,
+            errorMessage: errorMessages.size ? [...errorMessages].join(', ') : null,
+        },
+    };
+};
+
+const orderGeneratedMessage = (contractNo) =>
+    `Order already generated for Contract No ${contractNo}. CSL cannot be replaced.`;
+
+// Order plan exists for the contract (sob_mst.processed = 1). Also matches the contract no
+// without its trailing letters, the form SOB contract lists may hold.
+const isOrderGenerated = (orderGeneratedSet, contractNo) => {
+    const exact = String(contractNo || '').trim();
+    const stripped = exact.replace(/(\d+)[^\d]*$/, '$1');
+    return orderGeneratedSet.has(exact) || orderGeneratedSet.has(stripped);
+};
+
+// Contracts in this upload that already have a CSL (re-import will replace them)
+const existingCslContracts = async (contractNos) => {
+    const list = [...new Set(contractNos.filter(Boolean))];
+    if (!list.length) return new Set();
+
+    const [rows] = await connection.execute(
+        `SELECT DISTINCT contractNo FROM csl_mst WHERE contractNo IN (${list.map(() => '?').join(',')})`,
+        list
+    );
+    return new Set(rows.map((r) => r.contractNo));
+};
+
+// Preview rows for the "View" step
+const buildPreview = async (allSheetContents, contractDetails) => {
+    const contractNos = allSheetContents.map((obj) => Object.keys(obj)[0]);
+    const [orderGenerated, existingCsl] = await Promise.all([
+        getProcessedContractNos(),
+        existingCslContracts(contractNos),
+    ]);
+
+    return allSheetContents.map((obj, index) => {
+        const contractNo = Object.keys(obj)[0];
+        const details = { ...contractDetails[contractNo] };
+
+        // Order already generated → same rule the import enforces; shown as an error, not replaceable
+        const blocked = isOrderGenerated(orderGenerated, contractNo);
+        if (blocked) {
+            details.errorMessage = [details.errorMessage, orderGeneratedMessage(contractNo)]
+                .filter(Boolean)
+                .join(', ');
+        }
+
+        return {
+            id: index + 1,
+            contractNo,
+            ...details,
+            childItems: obj[contractNo],
+            // CSL exists but no order yet → user is asked to confirm, then it is replaced
+            contractLoaded: !blocked && existingCsl.has(contractNo),
+        };
+    });
+};
+
 exports.import = async (req, res) => {
     try {
         const { type, contractList: excelDataArray } = req.body;
 
-        if (!excelDataArray || excelDataArray.length === 0) {
+        if (!Array.isArray(excelDataArray) || excelDataArray.length === 0) {
             throw new CustomError('Please select a file!', 400);
         }
 
-        // Export to excel
+        if (!IMPORT_TYPES.includes(type)) {
+            throw new CustomError('Invalid type id provided!', 400);
+        }
+
+        // Export to excel (contractList holds preview rows here, not files)
         if (type === 'Export') {
             return await exportCSL(res, excelDataArray);
         }
@@ -60,109 +337,22 @@ exports.import = async (req, res) => {
         const allSheetContents = [];
         const contractDetails = {};
 
-        let hdrContractNo;
-        let FIM = null;
+        for (const file of excelDataArray) {
+            const workbook = await loadWorkbook(file);
+            const { contractNo, items, details } = parseCslWorkbook(workbook, file.name);
 
-        for (const excelData of excelDataArray) {
-            const base64Data = excelData.data.replace(
-                /^data:.*?;base64,/,
-                ""
-            );
-            const buffer = Buffer.from(base64Data, "base64");
-
-            const workbook = new exceljs.Workbook();
-            await workbook.xlsx.load(buffer);
-
-            const sheetContents = [];
-            const errorMessages = new Set();
-
-            workbook.eachSheet((worksheet) => {
-                if (worksheet.name === "PackList") {
-                    hdrContractNo = worksheet.getRow(3).getCell(1).text || "";
-                    const rowFIM = worksheet.getRow(3).getCell(6).text || "";
-                    FIM = (rowFIM.match(/^[^\d]*/) || [""])[0];
-
-                    worksheet.eachRow((row, rowNumber) => {
-                        if (rowNumber > 2) {
-                            const contractNo = row.getCell(1).value;
-                            const boxNo = row.getCell(6).value;
-
-                            if (!contractNo && !boxNo) return; // skip empty rows
-
-                            if (boxNo == null) {
-                                errorMessages.add(`Box number is empty in Contract No ${hdrContractNo}`);
-                            } else if (!String(boxNo).startsWith(FIM)) {
-                                errorMessages.add(`Box number does not start with FIM: ${boxNo} at Contract No ${hdrContractNo}`);
-                            } else if (hdrContractNo !== contractNo) {
-                                errorMessages.add(`Mismatched Contract no ${contractNo} in sheet with header ${hdrContractNo}`);
-                            } else if (row.getCell(3).value == null) {
-                                errorMessages.add(`Quantity required for Part ${row.getCell(2).value}`);
-                            }
-
-                            const csl = {
-                                id: rowNumber,
-                                contractNo,
-                                partNo: row.getCell(2).value,
-                                Qty: row.getCell(3).value,
-                                desc: row.getCell(5).value,
-                                boxNo,
-                            };
-                            sheetContents.push(csl);
-                        }
-                    });
-                }
-            });
-
-            allSheetContents.push({ [hdrContractNo]: sheetContents });
-
-            const contractWS = workbook.getWorksheet(1);
-            contractDetails[hdrContractNo] = {
-                FIM,
-                duty: contractWS.getCell("C2").value,
-                stop: contractWS.getCell("C3").value,
-                type: FIM.replace(/FIM/g, "") || FIM,
-                errorMessage: errorMessages.size ? [...errorMessages].join(', ') : null
-            };
+            allSheetContents.push({ [contractNo]: items });
+            contractDetails[contractNo] = details;
         }
-
-        let message = '';
-        let result = [];
 
         if (type === 'View') {
-            const allProcessedContracts = await processedContracts();
-
-            allSheetContents.forEach((obj, index) => {
-                const contractNo = Object.keys(obj)[0];
-                const child = obj[contractNo];
-                const modifiedContractNo = (contractNo || "").replace(/(\d+)[^\d]*$/, '$1');
-
-                const contractLoaded = allProcessedContracts.includes(modifiedContractNo);
-
-                result.push({
-                    id: index + 1,
-                    contractNo,
-                    ...contractDetails[contractNo],
-                    childItems: child,
-                    contractLoaded
-                });
-            });
-
-            message = 'Contracts list';
-        } else if (type === 'Import') {
-            result = await insertCSLData(allSheetContents, contractDetails);
-            if (result) {
-                message = 'Successfully imported';
-                return handleSuccessResponse(res, message);
-            }
-        } else {
-            throw new CustomError('Invalid type id provided!', 400);
+            const result = await buildPreview(allSheetContents, contractDetails);
+            return res.status(200).json({ success: true, message: 'Contracts list', data: result });
         }
 
-        return res.status(200).json({
-            success: true,
-            message,
-            data: result
-        });
+        // type === 'Import'
+        await insertCSLData(allSheetContents, contractDetails);
+        return handleSuccessResponse(res, 'Successfully imported');
     } catch (err) {
         return handleErrorResponse(res, err);
     }
@@ -238,28 +428,7 @@ const exportCSL = async (res, contractList) => {
     }
 };
 
-const processedContracts = async () => {
-    try {
-        const [rows] = await connection.execute(`
-            SELECT sob_mst.contractNos FROM order_plannings op
-            INNER JOIN sob_mst on sob_mst.id = op.sobMstId
-            WHERE mrpStatus = ?`
-            , [1]);
-
-        // Aggregate all contract numbers into a single array
-        let allContracts = [];
-        rows.forEach(row => {
-            if (row.contractNos) {
-                allContracts = allContracts.concat(row.contractNos.split(','));
-            }
-        });
-
-        return allContracts;
-    } catch (err) {
-        throw err;
-    }
-}
-
+// Contract numbers whose SOB already has an order plan (set in orderPlanningController)
 const getProcessedContractNos = async () => {
     const [rows] = await connection.execute(
         `
@@ -405,11 +574,9 @@ async function masterCsl(
     const { FIM, duty, stop, type } = contractDetails;
     const dateTime = await currentDateTime();
 
-    if (processedContractsSet.has(contractNo)) {
-        throw new CustomError(
-            `ContractNo - ${contractNo} is already produced!`,
-            400
-        );
+    // Order already generated → never replace (same rule the preview shows)
+    if (isOrderGenerated(processedContractsSet, contractNo)) {
+        throw new CustomError(orderGeneratedMessage(contractNo), 400);
     }
 
     // ✅ Lock only this contract row
@@ -455,61 +622,64 @@ async function insertCSLData(sheetContents, contractDetails) {
     const conn = await connection.getConnection();
     const MAX_RETRIES = 3;
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        try {
-            const processedContractsSet = await getProcessedContractNos();
+    // try/finally so the connection goes back to the pool on success, error and retry exhaustion
+    try {
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                const processedContractsSet = await getProcessedContractNos();
 
-            await conn.beginTransaction();
+                await conn.beginTransaction();
 
-            // ✅ CRITICAL: consistent order to avoid deadlocks
-            const sortedSheets = [...sheetContents].sort((a, b) => {
-                const keyA = Object.keys(a)[0];
-                const keyB = Object.keys(b)[0];
-                return keyA.localeCompare(keyB);
-            });
+                // ✅ CRITICAL: consistent order to avoid deadlocks
+                const sortedSheets = [...sheetContents].sort((a, b) => {
+                    const keyA = Object.keys(a)[0];
+                    const keyB = Object.keys(b)[0];
+                    return keyA.localeCompare(keyB);
+                });
 
-            for (const sheetContent of sortedSheets) {
-                const contractNo = Object.keys(sheetContent)[0];
+                for (const sheetContent of sortedSheets) {
+                    const contractNo = Object.keys(sheetContent)[0];
 
-                const cslMstId = await masterCsl(
-                    conn,
-                    contractNo,
-                    contractDetails[contractNo],
-                    processedContractsSet
-                );
-
-                const cslDetails = sheetContent[contractNo].map(
-                    ({ partNo, Qty, desc, boxNo }) => [
-                        cslMstId,
+                    const cslMstId = await masterCsl(
+                        conn,
                         contractNo,
-                        partNo,
-                        Qty,
-                        desc,
-                        boxNo
-                    ]
-                );
+                        contractDetails[contractNo],
+                        processedContractsSet
+                    );
 
-                if (cslDetails.length) {
-                    await bulkInsertCSLDetails(conn, cslDetails);
+                    const cslDetails = sheetContent[contractNo].map(
+                        ({ partNo, Qty, desc, boxNo }) => [
+                            cslMstId,
+                            contractNo,
+                            partNo,
+                            Qty,
+                            desc,
+                            boxNo
+                        ]
+                    );
+
+                    if (cslDetails.length) {
+                        await bulkInsertCSLDetails(conn, cslDetails);
+                    }
                 }
+
+                await conn.commit();
+                return true;
+
+            } catch (err) {
+                await conn.rollback();
+
+                // ✅ retry for deadlocks
+                if (err.code === 'ER_LOCK_DEADLOCK' && attempt < MAX_RETRIES) {
+                    continue;
+                }
+
+                throw err;
             }
-
-            await conn.commit();
-            return true;
-
-        } catch (err) {
-            await conn.rollback();
-
-            // ✅ retry for deadlocks
-            if (err.code === 'ER_LOCK_DEADLOCK' && attempt < MAX_RETRIES) {
-                continue;
-            }
-
-            throw err;
         }
+    } finally {
+        conn.release();
     }
-
-    conn.release();
 }
 
 async function bulkInsertCSLDetails(conn, cslDetails) {
@@ -531,7 +701,27 @@ async function bulkInsertCSLDetails(conn, cslDetails) {
 
 exports.cslExport = async (req, res) => {
     try {
-        const { cslMstId } = req.query;
+        const { cslMstId, fromDate, toDate } = req.query;
+        const isDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
+
+        // Columns must stay in header order: Contract No, Part No, Qty, Description, Box No
+        let cslQuery, cslParams;
+        if (cslMstId) {
+            cslQuery = `SELECT contractNo, partNo, Qty, description, boxNo FROM csl WHERE cslMstId = ?`;
+            cslParams = [cslMstId];
+        } else if (isDate(fromDate) && isDate(toDate)) {
+            cslQuery = `
+                SELECT c.contractNo, c.partNo, c.Qty, c.description, c.boxNo
+                FROM csl c
+                INNER JOIN csl_mst m ON m.id = c.cslMstId
+                WHERE DATE(m.date) BETWEEN ? AND ?
+                ORDER BY m.id, c.id`;
+            cslParams = [fromDate, toDate];
+        } else {
+            throw new CustomError('Provide a CSL id, or a From and To date (YYYY-MM-DD).', 400);
+        }
+
+        const [cslRows] = await connection.execute(cslQuery, cslParams);
 
         const workbook = new exceljs.Workbook();
         const worksheet = workbook.addWorksheet('CSL');
@@ -548,8 +738,6 @@ exports.cslExport = async (req, res) => {
             cell.font = { bold: true, size: 13 };
             cell.alignment = { horizontal: "center", vertical: "middle" };
         });
-
-        const [cslRows] = await connection.execute(`SELECT contractNo, partNo, Qty, description, boxNo FROM csl WHERE cslMstId = ?`, [cslMstId]);
 
         cslRows.forEach(cslRow => {
             const rowData = Object.values(cslRow);

@@ -50,7 +50,7 @@ const macAndProDetails = async (conn, mrpMstId) => {
         INNER JOIN item_vs_pm iVp ON iVp.item = jc.itemId
         INNER JOIN mst_pm pm ON pm.id = iVp.process
         INNER JOIN machines m ON m.id = iVp.machineName
-        WHERE jc.mrpMstId = ? AND iVp.dflag = ?`,
+        WHERE jc.mrpMstId = ? AND iVp.dflag = ? AND m.machineCode NOT IN ('DXF', 'KITTING')`,
         [mrpMstId, 0]
     );
 
@@ -111,16 +111,20 @@ exports.shopFloorSchedule = async (conn, mrpMstId) => {
                     const { jcId, jcNo, Qty, processDetails } = machineAndProcesses[item];
 
                     processDetails.forEach((data) => {
-                        const { machineId, processId, machineName, process, pTime, cTime, count, totCount } = data;
+                        const { itemId, machineId, processId, machineName, process, pTime, cTime, count, totCount } = data;
 
-                        scheduleList.push({ mrpMstId, jcId, jcNo, item, machineId, processId, machineName, process, Qty, pTime, cTime, thickness, count, totCount })
+                        scheduleList.push({ itemId, mrpMstId, jcId, jcNo, item, machineId, processId, machineName, process, Qty, pTime, cTime, thickness, count, totCount })
                     });
                 }
             });
         });
 
-        await insertScheduleTask(conn, scheduleList)
-        await kittingMachinePlanning(conn, mrpMstId);   // kitting machine planning
+        // Only delete and re-insert when there is data — prevents silent data loss on empty scheduleList
+        if (scheduleList.length > 0) {
+            await conn.execute(`DELETE FROM sf_schedule WHERE mrpMstId = ?`, [mrpMstId]);
+            await insertScheduleTask(conn, scheduleList);
+            await kittingMachinePlanning(conn, mrpMstId);
+        }
 
         await conn.execute(`
             UPDATE order_plannings op 
@@ -155,6 +159,7 @@ exports.schedulingTasks = async (req, res) => {
             throw new CustomError(`No MRP records found for scheduling. Please check MRP data.`);
         }
         await this.shopFloorSchedule(conn, rows[0].id);
+        await conn.commit();
 
         return handleSuccessResponse(res, 'Successful');
     } catch (err) {
@@ -168,11 +173,12 @@ exports.schedulingTasks = async (req, res) => {
 const insertScheduleTask = async (conn, scheduleObj) => {
     try {
         if (scheduleObj.length === 0) return;
-        const insertQuery = `INSERT INTO sf_schedule (mrpMstId, jcId, jcNo, itemCode, machineId, processId, machine, process, Qty, cycleTime, plannedTime, count, totCount) VALUES ?`;
+        const insertQuery = `INSERT INTO sf_schedule (mrpMstId, jcId, jcNo, itemId, itemCode, machineId, processId, machine, process, Qty, cycleTime, plannedTime, count, totCount) VALUES ?`;
 
         const values = scheduleObj.map(obj => {
-            const { mrpMstId, jcId, jcNo, item, machineId, processId, machineName, process, Qty, pTime, cTime, count, totCount } = obj;
-            return [mrpMstId, jcId, jcNo, item, machineId, processId, machineName, process, Qty, pTime, cTime, count, totCount];
+            const { mrpMstId, jcId, jcNo, itemId, item, machineId, processId, machineName, process, Qty, cTime, pTime, count, totCount } = obj;
+            // pTime = per-piece cycle time, cTime = cycle time x Qty (see macAndProDetails)
+            return [mrpMstId, jcId, jcNo, itemId, item, machineId, processId, machineName, process, Qty, pTime || 0, cTime || 0, count || 0, totCount || 0];
         });
 
         await conn.query(insertQuery, [values]);
@@ -299,34 +305,30 @@ const checkShift = (date, shift) => {
 const currentSchedules = async (machine, KITTING_MACHINE, date, shift) => {
     const [completedTasks] = await connection.execute(`
         SELECT sfs.id, items.materialThickness as Thickness,  mm.mrpNo as 'MRP ID', sfs.itemCode as 'Part Number', items.itemName as Description, sfs.jcNo as 'JobCard No', DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS 'JobCard Date',
-            pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, jp.producedQty as 'Produced Qty', sfs.prod_qty as Produced_Qty, sfs.prod_shift
+            pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, sfs.prod_qty as 'Produced Qty', sfs.prod_shift
         FROM sf_schedule sfs
         INNER JOIN items ON items.itemCode = sfs.itemCode
-        LEFT JOIN job_card jc ON jc.id = sfs.jcId
         LEFT JOIN mst_uom AS uom ON uom.id = items.uom
         LEFT JOIN item_product_family pf ON pf.id = items.productFamily
         LEFT JOIN mrp_mst mm ON mm.id = sfs.mrpMstId
         LEFT JOIN order_plannings op ON op.id = mm.orderPlnId
-        LEFT JOIN jobcard_planning jp ON jp.jcId = sfs.jcId AND jp.machinename = sfs.machine
         WHERE sfs.machine = ? AND sfs.prod_date = ? AND sfs.prod_shift = ?
-        GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId
+        GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId, sfs.process, sfs.childItemCode
         ORDER BY sfs.id ASC`,
         [machine, date, shift]
     )
 
     const [tasks] = await connection.execute(`
         SELECT sfs.id, items.materialThickness as Thickness,  mm.mrpNo as 'MRP ID', sfs.itemCode as 'Part Number', items.itemName as Description, sfs.jcNo as 'JobCard No', DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS 'JobCard Date',
-            pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, jp.producedQty as 'Produced Qty', sfs.prod_qty as Produced_Qty, sfs.prod_shift
+            pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, sfs.prod_qty as 'Produced Qty', sfs.prod_shift
         FROM sf_schedule sfs
         INNER JOIN items ON items.itemCode = sfs.itemCode
-        LEFT JOIN job_card jc ON jc.id = sfs.jcId
         LEFT JOIN mst_uom AS uom ON uom.id = items.uom
         LEFT JOIN item_product_family pf ON pf.id = items.productFamily
         LEFT JOIN mrp_mst mm ON mm.id = sfs.mrpMstId
         LEFT JOIN order_plannings op ON op.id = mm.orderPlnId
-        LEFT JOIN jobcard_planning jp ON jp.jcId = sfs.jcId AND jp.machinename = sfs.machine AND jp.process = sfs.process
         WHERE sfs.machine = ? AND sfs.status = ?
-        GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId
+        GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId, sfs.process, sfs.childItemCode
         ORDER BY sfs.id ASC`,
         [machine, 0]
     )
@@ -353,17 +355,16 @@ exports.scheduledPlan = async (req) => {
 
         } else if (shiftStatus === 'Pre') {
             [rows] = await connection.execute(`
-                SELECT sfs.id, items.materialThickness as Thickness, mm.mrpNo as 'MRP ID', sfs.itemCode as 'Part Number', items.itemName as Description, sfs.jcNo as 'JobCard No', DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS 'JobCard Date',
-                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, sfs.plannedTime as 'Work Planned', sfs.Qty as Qty, jp.producedQty as 'Produced Qty', sfs.prod_qty as Produced_Qty
+                SELECT sfs.id, items.materialThickness as Thickness,  mm.mrpNo as 'MRP ID', sfs.itemCode as 'Part Number', items.itemName as Description, sfs.jcNo as 'JobCard No', DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS 'JobCard Date',
+                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, sfs.prod_qty as 'Produced Qty', sfs.prod_shift
                 FROM sf_schedule sfs
                 INNER JOIN items ON items.itemCode = sfs.itemCode
-                LEFT JOIN job_card jc ON jc.id = sfs.jcId
                 LEFT JOIN mst_uom AS uom ON uom.id = items.uom
                 LEFT JOIN item_product_family pf ON pf.id = items.productFamily
-                LEFT JOIN jobcard_planning jp ON jp.jcId = sfs.jcId AND jp.machinename = sfs.machine
                 LEFT JOIN mrp_mst mm ON mm.id = sfs.mrpMstId
                 LEFT JOIN order_plannings op ON op.id = mm.orderPlnId
                 WHERE sfs.machine = ? AND sfs.status = ? AND sfs.prod_date = ? AND sfs.prod_shift = ?
+                GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId, sfs.process, sfs.childItemCode
                 ORDER BY sfs.id`,
                 [machine, 1, date, shift]
             )
@@ -382,17 +383,15 @@ exports.scheduledPlan = async (req) => {
 
             const [completedTasks] = await connection.execute(`
                 SELECT sfs.id, items.materialThickness as Thickness,  mm.mrpNo as 'MRP ID', sfs.itemCode as 'Part Number', items.itemName as Description, sfs.jcNo as 'JobCard No', DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS 'JobCard Date',
-                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, jp.producedQty as 'Produced Qty', sfs.prod_qty as Produced_Qty, sfs.prod_shift
+                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, sfs.prod_qty as 'Produced Qty', sfs.prod_shift
                 FROM sf_schedule sfs
                 INNER JOIN items ON items.itemCode = sfs.itemCode
-                LEFT JOIN job_card jc ON jc.id = sfs.jcId
                 LEFT JOIN mst_uom AS uom ON uom.id = items.uom
                 LEFT JOIN item_product_family pf ON pf.id = items.productFamily
                 LEFT JOIN mrp_mst mm ON mm.id = sfs.mrpMstId
                 LEFT JOIN order_plannings op ON op.id = mm.orderPlnId
-                LEFT JOIN jobcard_planning jp ON jp.jcId = sfs.jcId AND jp.machinename = sfs.machine
                 WHERE sfs.machine = ? AND sfs.prod_date = ? AND prod_shift IN (${shiftPlaceHolder}) AND sfs.status = ?
-                GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId, sfs.process
+                GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId, sfs.process, sfs.childItemCode
                 ORDER BY sfs.id ASC`,
                 [machine, date, ...currentShifts, 1]
             )
@@ -407,17 +406,15 @@ exports.scheduledPlan = async (req) => {
 
             const [tasks] = await connection.execute(`
                 SELECT sfs.id, items.materialThickness as Thickness,  mm.mrpNo as 'MRP ID', sfs.itemCode as 'Part Number', items.itemName as Description, sfs.jcNo as 'JobCard No', DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS 'JobCard Date',
-                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, jp.producedQty as 'Produced Qty', sfs.prod_qty as Produced_Qty, sfs.prod_shift
+                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, sfs.prod_qty as 'Produced Qty', sfs.prod_shift
                 FROM sf_schedule sfs
                 INNER JOIN items ON items.itemCode = sfs.itemCode
-                LEFT JOIN job_card jc ON jc.id = sfs.jcId
                 LEFT JOIN mst_uom AS uom ON uom.id = items.uom
                 LEFT JOIN item_product_family pf ON pf.id = items.productFamily
                 LEFT JOIN mrp_mst mm ON mm.id = sfs.mrpMstId
                 LEFT JOIN order_plannings op ON op.id = mm.orderPlnId
-                LEFT JOIN jobcard_planning jp ON jp.jcId = sfs.jcId AND jp.machinename = sfs.machine AND jp.process = sfs.process
                 WHERE sfs.machine = ? AND sfs.status = ?
-                GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId
+                GROUP BY sfs.mrpMstId, sfs.itemCode, sfs.jcId, sfs.process, sfs.childItemCode
                 ORDER BY sfs.id ASC`,
                 [machine, 0]
             )
@@ -489,17 +486,12 @@ const curAndPostSchedules = async (machine, KITTING_MACHINE, completedTasks, tas
         // }
     }
 
-    // Return resultTasks sorted by id and without the 'id' field
-    // return resultTasks
-    //     .sort((a, b) => a.id - b.id)
-    //     .map(({ id, prod_qty, ...rest }) => rest);
-
     const result = resultTasks.sort((a, b) => a.id - b.id);
 
     if (machine === KITTING_MACHINE) {
-        return result.map(({ "Produced Qty": prodQty, "JobCard No": jcNo, prod_shift, ...rest }) => ({ ...rest }));
+        return result.map(({ "JobCard No": jcNo, prod_shift, ...rest }) => ({ ...rest }));
     } else {
-        return result.map(({ id, Produced_Qty, prod_shift, ...rest }) => rest);
+        return result.map(({ id, prod_shift, ...rest }) => rest);
     }
 };
 
@@ -831,9 +823,9 @@ exports.machinePlanning = async (req, res) => {
 
         let sql = `
             SELECT
-                sfs.id, items.materialThickness AS Thickness, mm.mrpNo AS MrpNo, sfs.itemCode AS PartNo, items.itemName AS Description,
-                sfs.jcNo AS JobcardNo, DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS KanbanDate, pf.name AS ProductType, sfs.cycleTime AS CTime,
-                uom.name AS UOM, sfs.plannedTime AS WorkPlanned, sfs.Qty AS Qty, COALESCE(jp.producedQty, 0) AS ProdQty, sfs.prod_shift AS ProdShift
+                sfs.id, items.materialThickness AS Thickness, mm.mrpNo AS MrpNo, sfs.itemCode AS PartNo, sfs.childItemCode as ChildPart, items.itemName AS Description,
+                sfs.jcNo AS JobcardNo, DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS KanbanDate, pf.name AS ProductType, COALESCE(sfs.cycleTime, 0) AS CTime,
+                uom.name AS UOM, COALESCE(sfs.plannedTime, 0) AS WorkPlanned, sfs.Qty AS Qty, COALESCE(jp.producedQty, 0) AS ProdQty, sfs.prod_shift AS ProdShift
             FROM sf_schedule sfs
             INNER JOIN mrp_mst mm ON mm.id = sfs.mrpMstId
             INNER JOIN order_plannings op ON op.id = mm.orderPlnId
@@ -875,24 +867,84 @@ exports.machinePlanning = async (req, res) => {
     }
 };
 
-// Aggregate child part counts into parent sf_schedule entries by process
+// Aggregate child part counts into parent sf_schedule entries by process and sync missing processes
 exports.aggregateChildCounts = async (conn, mrpMstId) => {
-    try {
-        await conn.execute(`
-            UPDATE sf_schedule s
-            INNER JOIN (
-                SELECT jcId, processId, SUM(\`count\`) AS childCountSum, SUM(totCount) AS childTotCountSum
-                FROM childpart_planning
-                WHERE mrpMstId = ?
-                GROUP BY jcId, processId
-            ) cp ON cp.jcId = s.jcId AND cp.processId = s.processId
-            SET s.\`count\` = s.\`count\` + cp.childCountSum, s.totCount = s.totCount + cp.childTotCountSum
-            WHERE s.mrpMstId = ?`,
-            [mrpMstId, mrpMstId]
-        );
+    // 1. Fetch all child process counts from childpart_planning with Job Card info
+    const [childRows] = await conn.execute(
+        `SELECT cp.jcId, cp.itemId AS childItemId, cp.itemCode AS childItemCode, cp.processId, cp.machineId, cp.machineName, cp.processName, COALESCE(cp.cycleTime, 0) AS cycleTime, COALESCE(cp.plannedTime, 0) AS plannedTime,
+            COALESCE(SUM(cp.\`count\`), 0) AS childCountSum, COALESCE(SUM(cp.totCount), 0) AS childTotCountSum,
+            jc.jcNo, jc.itemId, jc.itemCode, jc.Qty
+         FROM childpart_planning cp
+         JOIN job_card jc ON cp.jcId = jc.id
+         LEFT JOIN mst_pm vendorPm ON vendorPm.id = cp.processId
+         WHERE cp.mrpMstId = ? AND COALESCE(vendorPm.vendorProcess, 0) = 0 -- vendor steps aren't shop floor work
+         GROUP BY cp.jcId, cp.processId, cp.itemId, cp.itemCode`,
+        [mrpMstId]
+    );
 
-        return true;
-    } catch (err) {
-        throw err;
+    if (childRows.length === 0) return true;
+
+    // 2. Fetch all parent processes from sf_schedule
+    const [parentRows] = await conn.execute(
+        `SELECT * FROM sf_schedule WHERE mrpMstId = ? ORDER BY id ASC`,
+        [mrpMstId]
+    );
+
+    // Group parent rows by jcId using Map to preserve numeric types
+    const parentByJc = new Map();
+    parentRows.forEach(row => {
+        row.childItemId = row.childItemId || null;
+        row.childItemCode = row.childItemCode || null;
+        if (!parentByJc.has(row.jcId)) parentByJc.set(row.jcId, []);
+        parentByJc.get(row.jcId).push(row);
+    });
+
+    // Group formatted child rows by jcId using Map
+    const childByJc = new Map();
+    childRows.forEach(cRow => {
+        if (!childByJc.has(cRow.jcId)) childByJc.set(cRow.jcId, []);
+        childByJc.get(cRow.jcId).push({
+            mrpMstId: Number(mrpMstId),
+            jcId: cRow.jcId,
+            jcNo: cRow.jcNo,
+            itemId: cRow.itemId,
+            itemCode: cRow.itemCode,
+            childItemId: cRow.childItemId,
+            childItemCode: cRow.childItemCode,
+            machineId: cRow.machineId,
+            processId: cRow.processId,
+            machine: cRow.machineName,
+            process: cRow.processName,
+            Qty: cRow.Qty,
+            cycleTime: Number(cRow.cycleTime),
+            plannedTime: Number(cRow.plannedTime),
+            count: cRow.childCountSum,
+            totCount: cRow.childTotCountSum
+        });
+    });
+
+    const finalScheduleList = [];
+    const jcIds = new Set([...parentByJc.keys(), ...childByJc.keys()]);
+
+    // Add child processes first, then parent processes for each jcId
+    for (const jcId of jcIds) {
+        if (childByJc.has(jcId)) finalScheduleList.push(...childByJc.get(jcId));
+        if (parentByJc.has(jcId)) finalScheduleList.push(...parentByJc.get(jcId));
     }
+
+    if (finalScheduleList.length > 0) {
+        // Delete old records for this mrpMstId
+        await conn.execute(`DELETE FROM sf_schedule WHERE mrpMstId = ?`, [mrpMstId]);
+
+        // Re-insert the synchronized and ordered list
+        const insertQuery = `INSERT INTO sf_schedule (mrpMstId, jcId, jcNo, itemId, itemCode, childItemId, childItemCode, machineId, processId, machine, process, Qty, cycleTime, plannedTime, count, totCount) VALUES ?`;
+        const values = finalScheduleList.map(obj => [
+            obj.mrpMstId, obj.jcId, obj.jcNo, obj.itemId, obj.itemCode, obj.childItemId || null, obj.childItemCode || null, obj.machineId, obj.processId,
+            obj.machine, obj.process, obj.Qty, obj.cycleTime, obj.plannedTime, obj.count, obj.totCount
+        ]);
+
+        await conn.query(insertQuery, [values]);
+    }
+
+    return true;
 };

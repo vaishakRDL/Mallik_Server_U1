@@ -154,10 +154,10 @@ const moveToFG = async (conn, sfgId, sfgNo = null, sfgVerifiedQty, addedBy) => {
             ['Completed', sfgVerifiedQty, sfgVerifiedQty, sfgId]
         );
         
-        await conn.execute(
-            `UPDATE items SET totStk = totStk + ? WHERE id = ?`,
-            [sfgVerifiedQty, itemId]
-        );
+        // await conn.execute(
+        //     `UPDATE items SET totStk = totStk + ? WHERE id = ?`,
+        //     [sfgVerifiedQty, itemId]
+        // );
 
         await conn.execute(`
             UPDATE job_card

@@ -6,8 +6,8 @@ exports.store = async (req, res) => {
     try {
         const data = req.body;
 
-        const values = [data.contractNo, data.partNo, data.Qty, data.boxNo];
-        const [rows, fields] = await connection.execute('INSERT INTO csl (contractNo, partNo, Qty, boxNo, description) VALUES (?, ?, ?, ?. ?)', values);
+        const values = [data.contractNo, data.partNo, data.Qty, data.boxNo, data.description ?? null];
+        const [rows, fields] = await connection.execute('INSERT INTO csl (contractNo, partNo, Qty, boxNo, description) VALUES (?, ?, ?, ?, ?)', values);
 
         if (rows.affectedRows > 0) {
             //console.log(fields)
