@@ -202,6 +202,42 @@ exports.view = async (req, res) => {
  * GET /boxKit/qcStatus?crNumber=..&fimNumber=..
  * Looks up assembly_qc_counts.qcStatus (0 or 1) for the given crNumber (contractNo) + fimNumber (fimNo).
  */
+// exports.getQcStatus = async (req, res) => {
+//     try {
+//         const { crNumber, fimNumber } = req.query;
+//         const isStr = (v) => typeof v === 'string' && v.trim() !== '';
+
+//         if (!isStr(crNumber) || !isStr(fimNumber)) {
+//             return res.status(400).json({
+//                 success: false,
+//                 message: 'crNumber and fimNumber query parameters are required',
+//             });
+//         }
+
+//         const [rows] = await connection.query(
+//             'SELECT qcStatus FROM assembly_qc_counts WHERE contractNo = ? AND fimNo = ?',
+//             [crNumber, fimNumber]
+//         );
+
+//         if (!rows.length) {
+//             return res.status(404).json({
+//                 success: false,
+//                 message: `No record found for crNumber ${crNumber} and fimNumber ${fimNumber}`,
+//             });
+//         }
+
+//         return res.status(200).json({
+//             success: true,
+//             message: 'QC status',
+//             qcStatus: rows[0].qcStatus,
+//         });
+//     } catch (err) {
+//         return handleErrorResponse(res, err);
+//     }
+// };
+
+
+
 exports.getQcStatus = async (req, res) => {
     try {
         const { crNumber, fimNumber } = req.query;
@@ -214,10 +250,24 @@ exports.getQcStatus = async (req, res) => {
             });
         }
 
-        const [rows] = await connection.query(
-            'SELECT qcStatus FROM assembly_qc_counts WHERE contractNo = ? AND fimNo = ?',
-            [crNumber, fimNumber]
-        );
+        const lookupQcStatus = async (fim) => {
+            const [rows] = await connection.query(
+                'SELECT qcStatus FROM assembly_qc_counts WHERE contractNo = ? AND fimNo = ?',
+                [crNumber, fim]
+            );
+            return rows;
+        };
+
+        let rows = await lookupQcStatus(fimNumber);
+
+        if (!rows.length) {
+            // e.g. "LFIM4.4" / "ELFIM4.4" -> "FIM4.4": only when fimNumber is one
+            // unbroken token (no spaces) do we strip the prefix before "FIM".
+            const fimIndex = fimNumber.indexOf('FIM');
+            if (fimIndex > 0 && !/\s/.test(fimNumber)) {
+                rows = await lookupQcStatus(fimNumber.slice(fimIndex));
+            }
+        }
 
         if (!rows.length) {
             return res.status(404).json({
