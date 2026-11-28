@@ -5,15 +5,15 @@ const { jobCardPlanning, childPartPlanning } = require('./planningController');
 const { shopFloorSchedule, aggregateChildCounts } = require('./scheduleController');
 const { storeRequestNote } = require('./storeReqController');
 
-const npdItemsCheck = async (opId) => {
+const npdItemsCheck = async (opId, db = connection) => {
     try {
-        const [orderRows] = await connection.execute(`SELECT itemCode FROM orderlist WHERE orderPlnId = ?`, [opId]);
+        const [orderRows] = await db.execute(`SELECT itemCode FROM orderlist WHERE orderPlnId = ?`, [opId]);
         if (orderRows.length === 0) throw new CustomError(`Items not found!`);
 
         const itemCodes = orderRows.map(row => row.itemCode);
         const placeholders = itemCodes.map(() => '?').join(',');
 
-        const [itemRows] = await connection.execute(`SELECT itemCode FROM items WHERE itemCode IN (${placeholders})`, itemCodes);
+        const [itemRows] = await db.execute(`SELECT itemCode FROM items WHERE itemCode IN (${placeholders})`, itemCodes);
 
         if (itemRows.length !== itemCodes.length) {
             throw new CustomError(`Npd Items are not registered!`, 400);
@@ -25,11 +25,14 @@ const npdItemsCheck = async (opId) => {
     }
 }
 
-exports.fetchSobItems = async (opId) => {
+// `db`: the MRP transaction's connection. The order row is read with FOR UPDATE, so a second
+// request for the same order waits here and then sees mrpStatus = 1 (no double generation).
+exports.fetchSobItems = async (opId, db = connection) => {
     try {
         let isOrderInput = false;
         let isBatchProd = true;
-        const [rows] = await connection.execute('SELECT * FROM order_plannings WHERE id = ?', [opId]);
+        const lock = db === connection ? '' : ' FOR UPDATE';
+        const [rows] = await db.execute(`SELECT * FROM order_plannings WHERE id = ?${lock}`, [opId]);
 
         if (rows.length === 0) throw new CustomError('Order Planing not found!', 404);
 
@@ -38,12 +41,12 @@ exports.fetchSobItems = async (opId) => {
         if (mrpStatus === 1) throw new CustomError('MRP has already been generated for this order!', 400);
 
         if (isNpd) {
-            await npdItemsCheck(opId);
+            await npdItemsCheck(opId, db);
         }
 
         if (saleId != null) {
             isOrderInput = true;
-            const [OIRows] = await connection.execute('SELECT id FROM sales WHERE id = ? AND isBatchProd = ?', [rows[0].saleId, 1]);
+            const [OIRows] = await db.execute('SELECT id FROM sales WHERE id = ? AND isBatchProd = ?', [rows[0].saleId, 1]);
             if (!OIRows.length) {
                 isBatchProd = false;
             }
@@ -53,7 +56,7 @@ exports.fetchSobItems = async (opId) => {
             INNER JOIN items ON items.itemCode = ol.itemCode
             WHERE ol.orderPlnId = ?
         `;
-        const [cRows] = await connection.execute(query, [opId]);
+        const [cRows] = await db.execute(query, [opId]);
 
         return { isOrderInput, isBatchProd, rows, cRows };
     } catch (err) {
@@ -98,19 +101,19 @@ exports.storeMrp = async (conn, mrpMstId, sobList) => {
             item.contractNos = Array.from(item.contractNos).join(',');
         });
 
-        // Generate insertion promises
-        const insertPromises = Object.values(aggregatedData).map(item =>
-            conn.execute(
-                'INSERT INTO mrp (mrpMstId, orderPlnId, orderListId, contractNos, jcId, itemId, itemCode, Qty, fim, jcPart) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [item.mrpMstId, item.orderPlnId, item.orderListId, item.contractNos, item.jcId, item.itemId, item.itemCode, item.Qty, item.fim, item.jcPart]
-            )
+        // One multi-row insert instead of one query per row
+        const rowsToInsert = Object.values(aggregatedData).map(item =>
+            [item.mrpMstId, item.orderPlnId, item.orderListId, item.contractNos, item.jcId, item.itemId, item.itemCode, item.Qty, item.fim, item.jcPart]
         );
 
-        // Execute all insertions concurrently
-        const insertResults = await Promise.all(insertPromises);
-
-        // Check if all insertions were successful
-        const allSuccessful = insertResults.every(result => result[0].affectedRows > 0);
+        let allSuccessful = true;
+        if (rowsToInsert.length) {
+            const [result] = await conn.query(
+                'INSERT INTO mrp (mrpMstId, orderPlnId, orderListId, contractNos, jcId, itemId, itemCode, Qty, fim, jcPart) VALUES ?',
+                [rowsToInsert]
+            );
+            allSuccessful = result.affectedRows === rowsToInsert.length;
+        }
 
         if (allSuccessful) {
             //console.log('MRP insertion successful.');
@@ -169,7 +172,7 @@ exports.splitFim = async (fim) => {
     return finalFim;
 }
 
-exports.checkJcCondition = async (isBatchProd, itemCode) => {
+exports.checkJcCondition = async (isBatchProd, itemCode, db) => {
     try {
         const categories = ['BUY LC-S', 'MAKE'];
 
@@ -183,12 +186,28 @@ exports.checkJcCondition = async (isBatchProd, itemCode) => {
             query += ` AND jcPart = ?`;
             params.push('Y');
         }
-        const [rows] = await connection.execute(query, params);
+        const [rows] = await (db || connection).execute(query, params);
 
         return rows.length > 0 ? rows[0].id : false;
     } catch (error) {
         throw error;
     }
+};
+
+// Same answer as checkJcCondition, asked once per item code per MRP run (read on the MRP's connection)
+const isJcPart = (ctx, itemCode) => {
+    if (!ctx.jcCache.has(itemCode)) {
+        ctx.jcCache.set(itemCode, this.checkJcCondition(ctx.isBatchProd, itemCode, ctx.conn));
+    }
+    return ctx.jcCache.get(itemCode);
+};
+
+// BOM children of an item, read once per item code per MRP run
+const bomChildren = (ctx, itemCode) => {
+    if (!ctx.bomCache.has(itemCode)) {
+        ctx.bomCache.set(itemCode, this.getBomChildren(ctx.conn, itemCode));
+    }
+    return ctx.bomCache.get(itemCode);
 };
 
 // exports.checkJcCondition = async (isBatchProd, itemCode) => {
@@ -278,16 +297,29 @@ exports.getBomChildren = async (conn, itemCode) => {
     return rows;
 };
 
-exports.childItems = async (conn, ctx, parentQty, parentId, parentCode, alreadyCreated = false) => {
-    const rows = await this.getBomChildren(conn, parentCode);
+// `path`: item codes from the order line down to this item, used to stop a BOM that contains itself
+exports.childItems = async (conn, ctx, parentQty, parentId, parentCode, alreadyCreated = false, path = [parentCode]) => {
+    const rows = await bomChildren(ctx, parentCode);
     const childMrpList = [];
 
-    if (!alreadyCreated && await this.checkJcCondition(ctx.isBatchProd, parentCode)) {
+    if (!alreadyCreated && await isJcPart(ctx, parentCode)) {
         parentId = await this.storeJcPart(conn, ctx.orderId, ctx.mrpMstId, parentCode, parentQty, ctx.contractNo, ctx.docPrefix, ctx.uniqueNoRef);
     }
 
     for (const row of rows) {
-        const childQty = parentQty * Number(row.Qty);
+        if (row.isBom === 'Y' && path.includes(row.itemCode)) {
+            throw new CustomError(`BOM loop found: ${[...path, row.itemCode].join(' → ')}. Correct the BOM and try again.`, 400);
+        }
+
+        // A BOM line with quantity 0 / empty would create a job card with quantity 0: report it
+        // (the whole MRP is stopped and rolled back after all lines are checked)
+        const bomQty = Number(row.Qty);
+        if (!(bomQty > 0)) {
+            ctx.qtyErrors?.add(`BOM quantity is 0 for ${row.itemCode} in the BOM of ${parentCode}`);
+            continue;
+        }
+
+        const childQty = parentQty * bomQty;
         const child = {
             opId: ctx.opId, orderId: ctx.orderId, jcId: parentId,
             itemId: row.itemId, itemCode: row.itemCode, Qty: childQty,
@@ -297,9 +329,9 @@ exports.childItems = async (conn, ctx, parentQty, parentId, parentCode, alreadyC
         childMrpList.push(child);
 
         if (row.isBom === 'Y') {
-            const nested = await this.childItems(conn, ctx, childQty, parentId, row.itemCode, false);
+            const nested = await this.childItems(conn, ctx, childQty, parentId, row.itemCode, false, [...path, row.itemCode]);
             childMrpList.push(...nested);
-        } else if (await this.checkJcCondition(ctx.isBatchProd, row.itemCode)) {
+        } else if (await isJcPart(ctx, row.itemCode)) {
             await this.storeJcPart(conn, ctx.orderId, ctx.mrpMstId, row.itemCode, childQty, ctx.contractNo, ctx.docPrefix, ctx.uniqueNoRef);
         }
     }
@@ -354,18 +386,70 @@ const calculateToProduce = (part, requestedQty, item) => {
     return { toProduce, errorMsg: null };
 };
 
+// Named MySQL lock that lets only one MRP generation run at a time
+const MRP_LOCK = 'mallik_generate_mrp';
+const MRP_LOCK_WAIT_SECONDS = 60;
+
+// Mark the CSLs this order was built from as used (sobStatus = 1): the CSLs behind its SOB.
+// Older orders whose SOB rows carry no CSL link keep the previous rule (today's open CSLs).
+const markCslUsed = async (conn, opId) => {
+    const [result] = await conn.execute(`
+        UPDATE csl_mst SET sobStatus = 1
+        WHERE sobStatus = 0
+          AND id IN (
+              SELECT cslMstId FROM (
+                  SELECT DISTINCT s.cslMstId
+                  FROM sob s
+                  INNER JOIN order_plannings op ON op.sobMstId = s.sobMstId
+                  WHERE op.id = ? AND s.cslMstId IS NOT NULL
+              ) AS orderCsl
+          )`,
+        [opId]
+    );
+
+    if (result.affectedRows > 0) return;
+
+    const [[linked]] = await conn.execute(`
+        SELECT COUNT(*) AS n FROM sob s
+        INNER JOIN order_plannings op ON op.sobMstId = s.sobMstId
+        WHERE op.id = ? AND s.cslMstId IS NOT NULL`,
+        [opId]
+    );
+    if (Number(linked.n) === 0) {
+        await conn.execute(`UPDATE csl_mst SET sobStatus = 1 WHERE DATE(date) = CURDATE() AND sobStatus = 0`);
+    }
+};
+
 exports.generateMRP = async (req, res) => {
     const conn = await connection.getConnection();
-    await conn.beginTransaction();
+    let inTransaction = false;
+    let hasMrpLock = false;
 
     try {
+        await conn.beginTransaction();
+        inTransaction = true;
+
         const { orderId: opId, kanbanDate, typeOfOrder } = req.body;
         if (!opId || !kanbanDate || !typeOfOrder) throw new CustomError('Missing required fields!', 400);
+
+        // Take the locks before any other read, so every read below sees the latest committed data:
+        //  - the order row: a second request for the same order (double-click, two users) waits, then
+        //    gets "MRP has already been generated" instead of creating a second MRP
+        //  - one MRP run at a time: two MRPs generated at the same moment take MRP / Job Card numbers one
+        //    after the other instead of both getting the same numbers. A named lock is used so no
+        //    document_counter rows are held and other screens' document numbers are never blocked.
+        await conn.execute('SELECT id FROM order_plannings WHERE id = ? FOR UPDATE', [opId]);
+
+        const [[{ locked }]] = await conn.query(`SELECT GET_LOCK(?, ?) AS locked`, [MRP_LOCK, MRP_LOCK_WAIT_SECONDS]);
+        if (Number(locked) !== 1) {
+            throw new CustomError('Another MRP is being generated right now. Please try again in a moment.', 409);
+        }
+        hasMrpLock = true;
 
         const { docPrefix, incNo } = await this.getJcNo(conn, req);
         const uniqueNoRef = { value: incNo };
 
-        const { isOrderInput, isBatchProd, rows: opRows, cRows: sRows } = await this.fetchSobItems(opId);
+        const { isOrderInput, isBatchProd, rows: opRows, cRows: sRows } = await this.fetchSobItems(opId, conn);
         if (!sRows.length) throw new CustomError('SOB items not found!', 404);
 
         const mrpMstId = await this.storeMstMRP(conn, req, opRows);
@@ -374,36 +458,59 @@ exports.generateMRP = async (req, res) => {
         const itemQuery = `SELECT id, stockControl, minStockLvl as minStock, maxLvl as maxStock, totStk as curStock FROM items WHERE id = ? AND inActive = 0`;
         const stockErrorMsg = [];
 
+        // Stock is read once per item and reduced as order lines use it, so an item on two lines
+        // cannot count the same stock twice
+        const stockByItem = new Map();
+
+        // Item lookups shared by every line of this run
+        const jcCache = new Map();
+        const bomCache = new Map();
+
+        // Quantity 0 in a sales order line or in a BOM line (each reported once)
+        const qtyErrors = new Set();
+
         for (const s of sRows) {
             let orderQty = s.Qty;
 
+            // Sales order lines are not reduced by stock, so quantity 0 here is a data error
+            if (isOrderInput && !(Number(s.Qty) > 0)) {
+                qtyErrors.add(`Sales order quantity is 0 for ${s.itemCode}${s.contractNo ? ` (contract ${s.contractNo})` : ''}`);
+                continue;
+            }
+
             if (!isOrderInput) {
-                const [[itemDetails]] = await conn.execute(itemQuery, [s.itemId]);
-                const { toProduce, errorMsg } = calculateToProduce(s.itemCode, s.Qty, itemDetails);
+                if (!stockByItem.has(s.itemId)) {
+                    const [[itemDetails]] = await conn.execute(itemQuery, [s.itemId]);
+                    stockByItem.set(s.itemId, itemDetails);
+                }
+                const { toProduce, errorMsg } = calculateToProduce(s.itemCode, s.Qty, stockByItem.get(s.itemId));
 
                 if (errorMsg) stockErrorMsg.push(errorMsg);
                 orderQty = toProduce;
+
+                // Stock covers this line: nothing to produce, so no job card or MRP rows with quantity 0
+                if (!errorMsg && Number(orderQty) === 0) continue;
             }
 
             const fim = s.fimNo ? await this.splitFim(s.fimNo) : null;
-            const bomExists = (await conn.execute('SELECT 1 FROM bom_mst WHERE itemCode = ?', [s.itemCode]))[0].length > 0;
 
             let jcId = null;
-            const ctx = { isBatchProd, orderId: s.id, opId, mrpMstId, contractNo: s.contractNo, fim, docPrefix, uniqueNoRef };
+            const ctx = { conn, jcCache, bomCache, qtyErrors, isBatchProd, orderId: s.id, opId, mrpMstId, contractNo: s.contractNo, fim, docPrefix, uniqueNoRef };
 
-            if (await this.checkJcCondition(isBatchProd, s.itemCode)) {
+            if (await isJcPart(ctx, s.itemCode)) {
                 jcId = await this.storeJcPart(conn, s.id, mrpMstId, s.itemCode, orderQty, s.contractNo, docPrefix, uniqueNoRef);
             } else {
                 mrpList.push({ opId, orderId: s.id, jcId, itemId: s.itemId, itemCode: s.itemCode, Qty: orderQty, fim, contractNo: s.contractNo, isJcPart: s.jcPart });
             }
 
-            if (bomExists) {
-                const children = await this.childItems(conn, ctx, orderQty, jcId, s.itemCode, true);
-                mrpList.push(...children);
-            }
+            // Explode the BOM (an item without a BOM simply has no children)
+            const children = await this.childItems(conn, ctx, orderQty, jcId, s.itemCode, true);
+            mrpList.push(...children);
         }
-        if (stockErrorMsg.length) {
-            throw new CustomError(stockErrorMsg.join('; '), 400);
+        // Nothing is saved when any quantity or stock problem was found (all are listed together)
+        const errors = [...qtyErrors, ...stockErrorMsg];
+        if (errors.length) {
+            throw new CustomError(errors.join('; '), 400);
         }
 
         // console.log(mrpList)
@@ -423,9 +530,7 @@ exports.generateMRP = async (req, res) => {
                     `UPDATE order_plannings SET typeOfOrder = ?, kanbanDate = ?, status = ?, mrpStatus = ? WHERE id = ?`,
                     [typeOfOrder, kanbanDate, 'MRP', 1, opId]
                 ),
-                !isOrderInput
-                    ? conn.execute(`UPDATE csl_mst SET sobStatus = 1 WHERE DATE(date) = CURDATE() AND sobStatus = 0`)
-                    : null,
+                !isOrderInput ? markCslUsed(conn, opId) : null,
                 updateDocCounter(conn, 'Mrp'),
                 conn.execute(
                     `UPDATE document_counter SET counter = ? WHERE docType = 'JobCard' ORDER BY id DESC LIMIT 1`,
@@ -442,9 +547,12 @@ exports.generateMRP = async (req, res) => {
 
         throw new CustomError('Failed to store MRP!', 500);
     } catch (err) {
-        await conn.rollback();
+        if (inTransaction) await conn.rollback().catch(() => { });
         return handleErrorResponse(res, err);
     } finally {
+        // Released after commit/rollback, so the next run reads the counters this run saved.
+        // The lock belongs to the connection, so it must be freed before the connection goes back to the pool.
+        if (hasMrpLock) await conn.query(`SELECT RELEASE_LOCK(?)`, [MRP_LOCK]).catch(() => { });
         conn.release();
     }
 };

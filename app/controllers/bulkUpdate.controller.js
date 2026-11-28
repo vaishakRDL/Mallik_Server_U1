@@ -28,6 +28,12 @@ exports.bulkUpdateMaster = async (req, res) => {
         // Resolve Foreign Key names to IDs if strings are provided
         await resolveForeignKeys(conn, config, data);
 
+        // Master-specific checks before writing (e.g. duplicate item codes); ctx carries info to afterCommit
+        const ctx = {};
+        if (config.preUpdate) {
+            await config.preUpdate(conn, data, ctx);
+        }
+
         const updatedCount = await executeBulkUpdate(conn, config, data, username);
 
         if (config.postUpdate) {
@@ -35,6 +41,16 @@ exports.bulkUpdateMaster = async (req, res) => {
         }
 
         await conn.commit();
+
+        // Follow-up work that must not undo a committed update (e.g. search reindex)
+        if (config.afterCommit) {
+            try {
+                await config.afterCommit(ctx);
+            } catch (afterErr) {
+                console.error(`${type} after-commit step failed:`, afterErr);
+            }
+        }
+
         return handleSuccessResponse(res, `${type} bulk update completed`, { updatedCount });
     } catch (err) {
         await conn.rollback();

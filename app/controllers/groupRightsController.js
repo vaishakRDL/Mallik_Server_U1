@@ -1,21 +1,22 @@
 const { connection, handleErrorResponse, handleSuccessResponse } = require('../config/dbSql');
 
+// Read-only: a plain pooled query (no dedicated connection or transaction). The popup loads
+// four sections at once, so this keeps each request light.
 exports.getRights = async (req, res) => {
-  const conn = await connection.getConnection();
   try {
     const { type, code } = req.body;
 
-    await conn.beginTransaction();
-
     const fetchQuery = `
-      SELECT 
-        gr.*, menu.name AS menuName, menu.id AS menuId, menu.code
+      SELECT
+        gr.id, gr.type, gr.addData, gr.updateData, gr.deleteData, gr.viewData, gr.print,
+        gr.auth, gr.auth1, gr.opt1, gr.opt2, gr.opt3, gr.opt4, gr.opt5,
+        menu.name AS menuName, menu.id AS menuId, menu.code
       FROM group_rights gr
       INNER JOIN mst_menu AS menu ON gr.menuId = menu.id
       WHERE gr.groupCode = ? AND gr.type = ? AND gr.dflag = 0
     `;
 
-    const [results] = await conn.execute(fetchQuery, [code, type]);
+    const [results] = await connection.execute(fetchQuery, [code, type]);
 
     const transformedData = results.map(item => ({
       id: item.id,
@@ -38,15 +39,10 @@ exports.getRights = async (req, res) => {
       opt5: !!item.opt5
     }));
 
-    await conn.commit();
-
     return handleSuccessResponse(res, "MenuType Master list", transformedData);
 
   } catch (err) {
-    await conn.rollback();
     return handleErrorResponse(res, err);
-  } finally {
-    conn.release();
   }
 };
 
@@ -63,8 +59,6 @@ exports.submit = async (req, res) => {
     }
 
     await conn.beginTransaction();
-
-    const fetchQuery = `SELECT id FROM group_rights WHERE id = ?`;
 
     const updateQuery = `
       UPDATE group_rights
@@ -84,14 +78,17 @@ exports.submit = async (req, res) => {
       WHERE id = ?
     `;
 
-    for (const g of groups) {
-      /* ---- check existence ---- */
-      const [[row]] = await conn.execute(fetchQuery, [g.id]);
-
-      if (!row) {
-        throw new Error(`Data not found for id ${g.id}`);
+    /* ---- check existence of all rows in one query ---- */
+    if (groups.length) {
+      const [found] = await conn.query(`SELECT id FROM group_rights WHERE id IN (?)`, [groups.map((g) => g.id)]);
+      const foundIds = new Set(found.map((r) => String(r.id)));
+      const missing = groups.find((g) => !foundIds.has(String(g.id)));
+      if (missing) {
+        throw new Error(`Data not found for id ${missing.id}`);
       }
+    }
 
+    for (const g of groups) {
       /* ---- update ---- */
       await conn.execute(updateQuery, [
         g.addData,

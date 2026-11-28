@@ -28,6 +28,9 @@ async function start() {
     try {
         await loadModuleLocksFromDB();
 
+        // Create menu entries the UI expects (e.g. Revised Plan) with rights copied from their old code
+        await require("./app/controllers/groupMstController").ensureRequiredMenusOnStartup();
+
         const app = await createApp();
 
         // 👇 CREATE HTTP SERVER (CRITICAL)

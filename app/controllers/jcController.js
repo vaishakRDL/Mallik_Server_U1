@@ -133,9 +133,11 @@ exports.jcView = async (req, res) => {
             SELECT 
                 jc.id, jc.jcNo, jc.itemId, jc.Qty AS plannedQty, items.itemCode, items.itemName, items.materialThickness,
                 DATE_FORMAT(jc.created_at, '%d-%m-%Y') AS issuedDate, DATE_FORMAT(jc.created_at, '%d-%m-%Y') AS scheduledDate, DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS kanbanDate,
-                NULL AS scheduledDate, jc.grn, pfam.name AS productFamily, pfin.name AS productFinish, NULL AS finishingDetails, NULL AS materialSpec,
-                op.requestedBy AS planEngineer
-            FROM 
+                jc.grn, pfam.name AS productFamily, pfin.name AS productFinish,
+                -- Same sources as the Job Card popup (jobCard/details)
+                pfin.name AS finishingDetails, items.material AS materialSpec,
+                op.requestedBy AS planEngineer, mrp_mst.mrpNo
+            FROM
                 job_card jc
                 INNER JOIN mrp_mst ON mrp_mst.id = jc.mrpMstId
                 INNER JOIN order_plannings op ON op.id = mrp_mst.orderPlnId
@@ -159,8 +161,34 @@ exports.jcView = async (req, res) => {
             WHERE jp.jcId = ?
         `, [jcId]);
 
+        // Date, Shift and Operator per process: latest operator_details entry for this job card
+        // and machine (same rule as the Job Card popup, jobCard/details)
+        const machineNames = [...new Set(details.map((d) => d.machineName).filter(Boolean))];
+        const latestByMachine = new Map();
+
+        if (machineNames.length) {
+            const [operatorRows] = await connection.query(`
+                SELECT Machine_Name, Operator_Name, DATE_FORMAT(Date_time, '%d-%m-%Y') AS date, Shift
+                FROM operator_details
+                WHERE Jobcard_Number = ? AND Machine_Name IN (?)
+                ORDER BY id DESC
+            `, [check[0].jcNo, machineNames]);
+
+            for (const row of operatorRows) {
+                const key = String(row.Machine_Name).toUpperCase();
+                if (!latestByMachine.has(key)) latestByMachine.set(key, row);
+            }
+        }
+
+        for (const process of details) {
+            const op = latestByMachine.get(String(process.machineName || '').toUpperCase());
+            if (op) process.operator = op.Operator_Name;
+            process.date = op ? op.date : null;
+            process.shift = op ? op.Shift : null;
+        }
+
         const [childParts] = await connection.execute(`
-            SELECT 
+            SELECT
                 i.id, i.itemCode, i.itemName, i.materialThickness, m.Qty, m.Child_Produced_Qty as preparedQty
             FROM mrp m
             INNER JOIN items i ON i.id = m.itemId
@@ -373,7 +401,7 @@ exports.getJobCards = async (mrpMstIdStr, fromDate, toDate, type, part, thicknes
             SELECT 
                 jc.id, 
                 items.materialThickness AS Thickness, 
-                jc.mrpMstId AS MRPID, 
+                mm.mrpNo AS MRPID,
                 jc.itemCode AS PartNumber, 
                 items.itemName AS Description, 
                 jc.jcNo AS JobCardNo, 
@@ -456,7 +484,7 @@ exports.jcDetails = async (req, res) => {
                 items.id AS itemId, jc.id AS jcId, DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS kanbanDate, 
                 DATE_FORMAT(jc.created_at, '%d-%m-%Y') AS scheduledDate, jc.grn AS grnNo, pfam.name AS productFamily, 
                 loc.name AS location, items.itemCode, items.itemName, items.material, items.materialThickness, jc.Qty, 
-                pfin.name AS productFinish, op.requestedBy AS planEngineer, COALESCE(sfg.accQty, 0) AS approvedQty,
+                pfin.name AS productFinish, op.requestedBy AS planEngineer, mm.mrpNo, COALESCE(sfg.accQty, 0) AS approvedQty,
                 COALESCE(SUM(CASE WHEN pi.status = 'rework' THEN pi.totQlty ELSE 0 END), 0) AS reworkQty,
                 COALESCE(SUM(CASE WHEN pi.status = 'scrap' THEN pi.totQlty ELSE 0 END), 0) AS scrapQty,
                 CASE WHEN jc.isCompleted = 1 THEN COALESCE(sfg.sfgVerifiedQty, 0) END AS recievedQty,

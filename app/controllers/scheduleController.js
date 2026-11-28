@@ -356,7 +356,7 @@ exports.scheduledPlan = async (req) => {
         } else if (shiftStatus === 'Pre') {
             [rows] = await connection.execute(`
                 SELECT sfs.id, items.materialThickness as Thickness,  mm.mrpNo as 'MRP ID', sfs.itemCode as 'Part Number', items.itemName as Description, sfs.jcNo as 'JobCard No', DATE_FORMAT(op.kanbanDate, '%d-%m-%Y') AS 'JobCard Date',
-                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, sfs.prod_qty as 'Produced Qty', sfs.prod_shift
+                    pf.name as 'Product Type', sfs.cycleTime as CTime, uom.name as UOM, SUM(sfs.plannedTime) as 'Work Planned', sfs.Qty as Qty, sfs.prod_qty as 'Produced Qty'
                 FROM sf_schedule sfs
                 INNER JOIN items ON items.itemCode = sfs.itemCode
                 LEFT JOIN mst_uom AS uom ON uom.id = items.uom
