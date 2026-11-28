@@ -266,13 +266,11 @@ const parseCslWorkbook = (workbook, fileName) => {
 const orderGeneratedMessage = (contractNo) =>
     `Order already generated for Contract No ${contractNo}. CSL cannot be replaced.`;
 
-// Order plan exists for the contract (sob_mst.processed = 1). Also matches the contract no
-// without its trailing letters, the form SOB contract lists may hold.
-const isOrderGenerated = (orderGeneratedSet, contractNo) => {
-    const exact = String(contractNo || '').trim();
-    const stripped = exact.replace(/(\d+)[^\d]*$/, '$1');
-    return orderGeneratedSet.has(exact) || orderGeneratedSet.has(stripped);
-};
+// Order plan exists for the contract (sob_mst.processed = 1). Exact contract number only:
+// a suffixed contract (e.g. 52KK2954A) is a different contract from 52KK2954, and SOB stores
+// contract numbers exactly as in the CSL.
+const isOrderGenerated = (orderGeneratedSet, contractNo) =>
+    orderGeneratedSet.has(String(contractNo || '').trim());
 
 // Contracts in this upload that already have a CSL (re-import will replace them)
 const existingCslContracts = async (contractNos) => {

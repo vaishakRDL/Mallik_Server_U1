@@ -92,6 +92,11 @@ exports.loadExcel = async (req, res) => {
         // 4. Resolve IDs and Validate Foreign Keys
         if (data.length > 0) {
             await resolveAndValidateData(connection, config, data);
+
+            // Master-specific batch checks (e.g. duplicate item codes) shown as row errors in the preview
+            if (config.validateBatch) {
+                await config.validateBatch(connection, data);
+            }
         }
 
         return handleSuccessResponse(res, "Excel data parsed successfully", {

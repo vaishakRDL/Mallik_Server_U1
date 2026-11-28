@@ -4,7 +4,7 @@ const { collection: masterCollection } = require('../../utility/master');
 const { collection: itemCollection } = require('../../utility/itemMaster');
 const { fetchItemId, decodeBase64, fetchItemIds, getUser } = require('../../utility/utilityFunction');
 const { bulkCreationItems } = require('./itemExlV2Controller');
-const { incCacheVersion } = require('../itemController');
+const { incCacheVersion, indexPendingItems } = require('../itemController');
 
 exports.template = (req, res) => {
     try {
@@ -756,6 +756,10 @@ exports.storeBulkCreationItems = async (req, res) => {
         await incCacheVersion();
 
         await conn.commit();
+
+        // Make the new items searchable by any part of their code
+        indexPendingItems();
+
         return handleSuccessResponse(res, 'Items imported successfully');
     } catch (err) {
         await conn.rollback();

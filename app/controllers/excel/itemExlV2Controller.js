@@ -1,7 +1,7 @@
 const excel = require('exceljs');
 const { connection, handleSuccessResponse, handleErrorResponse } = require('../../config/dbSql');
 const { decodeBase64, getUser } = require('../../utility/utilityFunction');
-const { incCacheVersion } = require('../itemController');
+const { incCacheVersion, indexPendingItems } = require('../itemController');
 
 exports.template = (req, res) => {
     try {
@@ -389,6 +389,9 @@ exports.store = async (req, res) => {
         await incCacheVersion();
 
         await conn.commit();
+
+        // Make the new items searchable by any part of their code
+        indexPendingItems();
 
         return handleSuccessResponse(res, "Items imported successfully");
 

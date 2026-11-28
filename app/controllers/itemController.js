@@ -2,16 +2,65 @@ const { storeFile, getUser, generateNgrams, currentDateTimeInd } = require('../u
 const { connection, CustomError, handleErrorResponse, handleSuccessResponse } = require('../config/dbSql');
 const { paginateQuery, totRowCount } = require('../utility/pagination');
 const redisClient = require('../config/redisCleinet');
+const logger = require('../utility/logger');
+
+// Rebuild the search index (item_ngrams) for the given items ([{ id, itemCode }]) so each is found
+// by any part of its code. Runs after the items are saved; a failure is only logged
+// (ngStatus stays 0, so the manual rebuild picks them up).
+const reindexItems = async (items) => {
+    const CHUNK_SIZE = 1000;
+
+    for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+        const chunk = items.slice(i, i + CHUNK_SIZE);
+        const ids = chunk.map((it) => it.id);
+
+        try {
+            await connection.query(`DELETE FROM item_ngrams WHERE itemId IN (?)`, [ids]);
+
+            const gramRows = chunk.flatMap((it) =>
+                [...new Set(generateNgrams((it.itemCode || '').trim().toUpperCase()))].map((g) => [it.id, g])
+            );
+            if (gramRows.length) {
+                await connection.query(`INSERT IGNORE INTO item_ngrams (itemId, ng) VALUES ?`, [gramRows]);
+            }
+
+            await connection.query(`UPDATE items SET ngStatus = 1 WHERE id IN (?)`, [ids]);
+        } catch (err) {
+            logger.error({ message: `Item search index update failed for items ${ids.join(',')}: ${err.message}`, stack: err.stack });
+        }
+    }
+};
+
+const indexItemNgrams = (itemId, itemCode) => reindexItems([{ id: itemId, itemCode }]);
+
+// Reindex items by id with their current codes (used after Bulk Update changes item codes)
+exports.reindexItemsById = async (itemIds) => {
+    if (!itemIds?.length) return;
+
+    try {
+        const rows = [];
+        for (let i = 0; i < itemIds.length; i += 5000) {
+            const [chunkRows] = await connection.query(
+                `SELECT id, itemCode FROM items WHERE id IN (?)`,
+                [itemIds.slice(i, i + 5000)]
+            );
+            rows.push(...chunkRows);
+        }
+        await reindexItems(rows);
+    } catch (err) {
+        logger.error({ message: `Reindexing updated items failed: ${err.message}`, stack: err.stack });
+    }
+};
 
 exports.store = async (req, res) => {
     try {
         const item = req.body;
 
-        const fetch = `SELECT * FROM items WHERE itemCode = ? AND dflag = '0'`;
+        const fetch = `SELECT id FROM items WHERE itemCode = ? AND dflag = '0' LIMIT 1`;
         const [results] = await connection.execute(fetch, [item.itemCode]);
 
         if (results.length > 0) {
-            return res.status(400).json({ success: false, message: "Item name already exists!" });
+            return res.status(400).json({ success: false, message: "Item code already exists!" });
         }
         const createdBy = await getUser(req);
 
@@ -22,7 +71,8 @@ exports.store = async (req, res) => {
             'fimId', 'duty', 'grossWeight', 'netWeight', 'scrapWeight', 'rmItemCode', 'rmThickness', 'rmWidth',
             'rmLength', 'stockControl', 'material', 'materialThickness', 'jcPart', 'buyProdJC', 'partType', 'sdCode',
             'delPackageType', 'delLotQty', 'nonStockable', 'binNo', 'lotWiseItem', 'lotType', 'MOQ',
-            'INVTOOLSEL', 'TOOLID', 'ledTime', 'STCOND', 'RMItemId', 'createdBy'
+            'INVTOOLSEL', 'TOOLID', 'ledTime', 'STCOND', 'RMItemId', 'conversionConcept', 'conversionPart',
+            'conversionPartId', 'createdBy'
         ];
 
         // const values = columnNames.map(columnName => {
@@ -35,15 +85,20 @@ exports.store = async (req, res) => {
         //     }
         // });
 
-        const toBooleanNumber = (v) => (v === true ? 1 : 0);
+        // Same rules as update
+        const toBooleanNumber = (v) => (v === true || v === 1 ? 1 : 0);
         const yesNo = (v) => (v === 'Y' ? 'Y' : 'N');
+
+        // The form sends the image as `file` (base64); keep accepting a ready `filePath` too
+        const filePath = storeFile(item.file, 'item') || item.filePath || null;
 
         const specialHandlers = {
             createdBy: () => createdBy,
+            filePath: () => filePath,
             inActive: (item) => toBooleanNumber(item.inActive),
             nonStockable: (item) => toBooleanNumber(item.nonStockable),
             buyProdJC: (item) => yesNo(item.buyProdJC),
-            jcPart: (item) => yesNo(item.buyProdJC),
+            jcPart: (item) => yesNo(item.jcPart),
         };
 
         const values = columnNames.map((columnName) => {
@@ -67,7 +122,16 @@ exports.store = async (req, res) => {
             ) VALUES ${placeholderString}
         `;
 
-        await connection.execute(store, values);
+        const [result] = await connection.execute(store, values);
+
+        // New item must show up in search right away
+        await indexItemNgrams(result.insertId, item.itemCode);
+        try {
+            await this.incCacheVersion();
+        } catch (cacheErr) {
+            // Item is already saved; a Redis problem must not report the add as failed
+            logger.error({ message: `Item cache version bump failed: ${cacheErr.message}`, stack: cacheErr.stack });
+        }
 
         return res.status(200).json({ success: true, message: "Item added successfully" });
     } catch (err) {
@@ -84,13 +148,26 @@ exports.update = async (req, res) => {
         const { id } = req.params;
         const item = req.body;
 
-        const [itemRow] = await conn.execute(`SELECT id FROM items WHERE id = ?`, [id]);
+        const [itemRow] = await conn.execute(`SELECT id, itemCode FROM items WHERE id = ?`, [id]);
 
         if (!itemRow.length) {
             throw new CustomError('Item not found!', 404);
         }
+
+        // Same duplicate rule as store: no two active items with one code
+        if (item.itemCode) {
+            const [dupRows] = await conn.execute(
+                `SELECT id FROM items WHERE itemCode = ? AND dflag = '0' AND id <> ? LIMIT 1`,
+                [item.itemCode, id]
+            );
+            if (dupRows.length) {
+                throw new CustomError('Item code already exists!', 400);
+            }
+        }
+
         const updatedBy = await getUser(req);
-        const filePath = storeFile(item.file, 'item');
+        // Only a newly uploaded file replaces the stored one; no file → keep the existing filePath
+        const newFilePath = storeFile(item.file, 'item');
 
         const columnNames = [
             'itemCode', 'itemName', 'itemGroup', 'tallyOrErp', 'inActive', 'uom', 'stdRate', 'gstCategory',
@@ -120,8 +197,12 @@ exports.update = async (req, res) => {
         });
 
         // Add metadata fields
-        updateParts.push('filePath = ?', 'updatedBy = ?', 'updated_at = NOW()');
-        values.push(filePath, updatedBy, id);
+        if (newFilePath) {
+            updateParts.push('filePath = ?');
+            values.push(newFilePath);
+        }
+        updateParts.push('updatedBy = ?', 'updated_at = NOW()');
+        values.push(updatedBy, id);
 
         const updateQuery = `UPDATE items SET ${updateParts.join(', ')} WHERE id = ?`;
 
@@ -130,6 +211,11 @@ exports.update = async (req, res) => {
         await this.incCacheVersion();
 
         await conn.commit();
+
+        // Code changed → rebuild its search index so the new code is found by any part of it
+        if ((itemRow[0].itemCode || '') !== (item.itemCode || '')) {
+            await indexItemNgrams(Number(id), item.itemCode);
+        }
 
         return handleSuccessResponse(res, 'Successfully updated');
     } catch (err) {
@@ -153,6 +239,9 @@ exports.delete = async (req, res) => {
         await this.handleDeletedRecords('items', rows[0], deletedUser)
 
         await connection.execute(`DELETE FROM items WHERE id = ?`, [id]);
+
+        // Remove its search index rows too (search re-checks items, but they would pile up)
+        await connection.execute(`DELETE FROM item_ngrams WHERE itemId = ?`, [id]);
 
         await this.incCacheVersion();
 
@@ -410,15 +499,12 @@ exports.updateItemRate = async (req, res) => {
 
         /* ---------- Validation ---------- */
         if (!Array.isArray(itemsList) || itemsList.length === 0) {
-            return handleErrorResponse(res, "Invalid or empty data");
+            throw new CustomError("Invalid or empty data", 400);
         }
 
         for (const item of itemsList) {
             if (!item.id || item.itemRate === undefined) {
-                return handleErrorResponse(
-                    res,
-                    "Each item must contain id and itemRate"
-                );
+                throw new CustomError("Each item must contain id and itemRate", 400);
             }
         }
 
@@ -783,18 +869,24 @@ exports.upsertItemNgrams = async (conn) => {
                 }
             }
 
+            // Mark only the rows indexed in this batch (an item added meanwhile is not marked done unindexed)
+            await conn.query(`UPDATE items SET ngStatus = 1 WHERE id IN (?)`, [rows.map((r) => r.id)]);
+
             // Fast pagination update
             lastId = rows[rows.length - 1].id;
         }
 
-        // Update only processed rows - avoids full table update
-        await conn.execute(
-            `UPDATE items SET ngStatus = 1 WHERE ngStatus = 0`
-        );
-
     } catch (err) {
         throw err;
     }
+};
+
+// Index items not yet in the search index (e.g. after an Excel import). Runs in the background
+// after the import has committed; errors are only logged.
+exports.indexPendingItems = () => {
+    this.upsertItemNgrams(connection).catch((err) =>
+        logger.error({ message: `Indexing new items failed: ${err.message}`, stack: err.stack })
+    );
 };
 
 exports.buildNgramsForAllItems = async (req, res) => {
